@@ -26,8 +26,9 @@ const getApiKey = () => {
   return '';
 };
 
+// Initialize default instance
 const apiKey = getApiKey();
-const ai = new GoogleGenAI({ apiKey });
+const ai = new GoogleGenAI({ apiKey: apiKey || 'DUMMY_KEY_FOR_INIT' });
 
 /**
  * Helpers to get file data
@@ -101,10 +102,14 @@ export const analyzeAttendanceImage = async (
   file: File, 
   students: Student[]
 ): Promise<AIAnalysisResult[]> => {
+  const currentKey = getApiKey();
+  if (!currentKey) throw new Error("API Key missing. Please check your configuration.");
+  
+  const client = new GoogleGenAI({ apiKey: currentKey });
   const imagePart = await fileToGenerativePart(file);
   const prompt = getAnalysisPrompt(students, "an image of an attendance sheet or whiteboard");
 
-  const response = await ai.models.generateContent({
+  const response = await client.models.generateContent({
     model: 'gemini-3-pro-preview', // Pro for image reasoning
     contents: {
       parts: [imagePart, { text: prompt }]
@@ -140,10 +145,14 @@ export const analyzeAttendanceAudio = async (
   file: File, 
   students: Student[]
 ): Promise<AIAnalysisResult[]> => {
+  const currentKey = getApiKey();
+  if (!currentKey) throw new Error("API Key missing. Please check your configuration.");
+
+  const client = new GoogleGenAI({ apiKey: currentKey });
   const audioPart = await fileToGenerativePart(file);
   const prompt = getAnalysisPrompt(students, "an audio recording of a teacher taking attendance");
 
-  const response = await ai.models.generateContent({
+  const response = await client.models.generateContent({
     model: 'gemini-2.5-flash',
     contents: {
       parts: [audioPart, { text: prompt }]
@@ -179,11 +188,15 @@ export const analyzeAttendanceText = async (
     file: File,
     students: Student[]
 ): Promise<AIAnalysisResult[]> => {
+    const currentKey = getApiKey();
+    if (!currentKey) throw new Error("API Key missing. Please check your configuration.");
+
+    const client = new GoogleGenAI({ apiKey: currentKey });
     // Read text content directly
     const textContent = await file.text();
     const prompt = getAnalysisPrompt(students, `a text document containing attendance info: "${textContent.substring(0, 5000)}..."`); // Limit context
 
-    const response = await ai.models.generateContent({
+    const response = await client.models.generateContent({
         model: 'gemini-2.5-flash',
         contents: {
             parts: [{ text: prompt }]
@@ -214,11 +227,12 @@ export const analyzeAttendanceText = async (
 
 /**
  * Live Client access
+ * Always creates a new instance to ensure the latest API key is used.
  */
 export const getGeminiLiveClient = () => {
-    if (!apiKey) {
-        // Return a dummy client or throw a clearer error that the UI can catch
-        console.warn("API Key missing. Live features will fail.");
+    const currentKey = getApiKey();
+    if (!currentKey) {
+        throw new Error("API Key is missing. Please check your environment settings.");
     }
-    return ai;
+    return new GoogleGenAI({ apiKey: currentKey });
 }

@@ -221,20 +221,26 @@ const App: React.FC = () => {
   const handleBulkUpdateStatus = (status: AttendanceStatus, targetName?: string) => {
       // Determine the active class context
       let targetClassId = (selectedClass && selectedClass.id) || dashboardClassId || classes[0]?.id;
+      let targetClassName = "";
 
       // AI Override
       if (targetName) {
           const match = classes.find(c => c.name.toLowerCase().includes(targetName.toLowerCase()));
-          if (match) targetClassId = match.id;
+          if (match) {
+              targetClassId = match.id;
+              targetClassName = match.name;
+          }
+      } else {
+          targetClassName = classes.find(c => c.id === targetClassId)?.name || "Current Class";
       }
       
-      if (!targetClassId) return;
+      if (!targetClassId) return { success: false, message: "No class selected." };
 
+      let count = 0;
       setRecords(prev => {
           const currentClassStudents = students.filter(s => s.classId === targetClassId);
           const newRecords = [...prev];
           
-          let count = 0;
           currentClassStudents.forEach(student => {
               const existingIdx = newRecords.findIndex(r => r.studentId === student.id && r.date === currentDate && r.session === currentSession);
               if (existingIdx >= 0) {
@@ -249,9 +255,9 @@ const App: React.FC = () => {
               }
               count++;
           });
-          console.log(`Bulk updated ${count} students to ${status} in ${targetClassId}`);
           return newRecords;
       });
+      return { success: true, message: `Marked ${count} students as ${status} in ${targetClassName}` };
   };
 
   const handleAIAnalysisComplete = (results: AIAnalysisResult[], targetClassId: string, date: string, session: SessionType) => {
@@ -303,45 +309,192 @@ const App: React.FC = () => {
     setView('roster'); 
   };
 
-  const handleLiveUpdate = (rollNo: string, status: AttendanceStatus, targetName?: string) => {
-      // 1. Identify Target Class: Dashboard or Roster?
-      let targetClassId = selectedClass?.id;
+  const handleLiveUpdate = (identifier: string, status: AttendanceStatus, targetName?: string): { success: boolean; message: string } => {
+      // 0. Handle multiple values in one string (e.g. "1, 2, 3" or "1 and 2")
+      // Split by comma or ' and '
+      const splitPattern = /[,&]|\s+and\s+/;
+      if (identifier.split(splitPattern).length > 1) {
+          const parts = identifier.split(splitPattern).map(s => s.trim()).filter(s => s);
+          let successCount = 0;
+          let messages = [];
+          for (const part of parts) {
+              const res = handleLiveUpdate(part, status, targetName);
+              if (res.success) successCount++;
+              messages.push(res.message);
+          }
+          return { 
+              success: successCount > 0, 
+              message: successCount === parts.length ? `All ${successCount} marked.` : `Marked ${successCount}/${parts.length}.` 
+          };
+      }
 
-      // AI Override for Target
+      // 1. Identify Target Class
+      let targetClassId = selectedClass?.id;
       if (targetName) {
         const match = classes.find(c => c.name.toLowerCase().includes(targetName.toLowerCase()));
-        if (match) {
-            targetClassId = match.id;
-            // Optionally auto-select/navigate to that class to show updates live
-            if (selectedClass?.id !== match.id) {
-               setSelectedClass({ id: match.id, name: match.name });
-               // If in dashboard, maybe don't force nav, but if in roster, yes.
-               if (view === 'roster') {
-                   // already there
-               }
-            }
-        }
+        if (match) targetClassId = match.id;
       }
 
-      if (view === 'dashboard' && !targetClassId) targetClassId = dashboardClassId;
-      if (!targetClassId && classes.length > 0) targetClassId = classes[0].id; // Fallback
-
-      if (!targetClassId) return;
-
-      // 2. Find Student in that Class
-      // Normalize input: remove leading zeros, whitespace, etc for robust matching
-      const normalizedInput = String(rollNo).trim().toLowerCase().replace(/^0+/, '');
+      // Default to dashboard class or first class if no target specified and not in roster
+      let searchScopeClassId = targetClassId || (view === 'dashboard' ? dashboardClassId : selectedClass?.id) || classes[0]?.id;
       
-      const student = students.find(s => {
-          const sRoll = String(s.rollNo).trim().toLowerCase().replace(/^0+/, '');
-          return sRoll === normalizedInput && s.classId === targetClassId;
-      });
+      const normalize = (s: string) => String(s).trim().toLowerCase().replace(/^0+/, '');
+      const searchNorm = normalize(identifier);
+
+      // Helper to search a list with PRIORITY
+      const findBestMatch = (list: Student[]) => {
+          // Priority 1: Exact Roll Match
+          const exactRoll = list.find(s => normalize(s.rollNo) === searchNorm);
+          if (exactRoll) return exactRoll;
+
+          // Priority 2: Exact Name Match
+          const exactName = list.find(s => s.name.toLowerCase() === searchNorm);
+          if (exactName) return exactName;
+          
+          // Priority 3: Fuzzy Name Match (ONLY if identifier is not a pure number)
+          // This prevents "1" matching "User 1"
+          const isNumber = /^\d+$/.test(searchNorm);
+          if (!isNumber) {
+              return list.find(s => s.name.toLowerCase().includes(searchNorm));
+          }
+          
+          return null;
+      };
+
+      let student = null;
       
+      // 2. Search in scoped class first
+      if (searchScopeClassId) {
+          student = findBestMatch(students.filter(s => s.classId === searchScopeClassId));
+      }
+
+      // 3. Global search fallback (ALWAYS try if not found yet)
+      if (!student) {
+           // Gather all matches globally
+           const allMatches: Student[] = [];
+           // Try exact roll first globally
+           const exactRolls = students.filter(s => normalize(s.rollNo) === searchNorm);
+           if (exactRolls.length > 0) {
+               // Prefer the one in the current view context if ambiguous (though we already checked scope)
+               // Otherwise just take the first one found
+               student = exactRolls[0]; 
+           } else {
+               // Try name matches globally
+               const isNumber = /^\d+$/.test(searchNorm);
+               if (!isNumber) {
+                    const nameMatches = students.filter(s => s.name.toLowerCase().includes(searchNorm));
+                    if (nameMatches.length > 0) student = nameMatches[0];
+               }
+           }
+      }
+
       if (student) {
           handleUpdateStatus(student.id, status, currentDate, currentSession); 
+          const clsName = classes.find(c => c.id === student?.classId)?.name;
+          return { success: true, message: `Marked ${student.name} (${clsName}) as ${status}.` };
       } else {
-          console.warn(`Student with Roll ${rollNo} not found in class ${targetClassId}`);
+          return { success: false, message: `Student '${identifier}' not found${targetName ? ` in '${targetName}'` : ''}.` };
       }
+  };
+
+  // AI-Specific Handlers for List Modification
+  const handleAIAddStudent = (name: string, rollNo: string, targetClassName?: string): { success: boolean, message: string } => {
+      let targetClassId = selectedClass?.id;
+      if (targetClassName) {
+          const match = classes.find(c => c.name.toLowerCase().includes(targetClassName.toLowerCase()));
+          if (match) targetClassId = match.id;
+      } else if (!targetClassId) {
+          targetClassId = dashboardClassId || classes[0]?.id;
+      }
+      
+      if (!targetClassId) return { success: false, message: "No target class found." };
+
+      const currentClass = classes.find(c => c.id === targetClassId);
+      const newRoll = rollNo || String((currentClass?.totalStudents || 0) + 1);
+
+      const newStudent: Student = {
+        id: `s-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        classId: targetClassId,
+        name: name || 'New Student',
+        rollNo: newRoll
+      };
+      
+      setStudents(prev => [...prev, newStudent]);
+      setClasses(prev => prev.map(c => c.id === targetClassId ? { ...c, totalStudents: c.totalStudents + 1 } : c));
+      
+      return { success: true, message: `Added ${name} to ${currentClass?.name}.` };
+  };
+
+  const handleDeleteStudent = (studentId: string) => {
+    // Robust delete that ensures we operate on current state
+    setStudents(currentStudents => {
+        const studentToDelete = currentStudents.find(s => s.id === studentId);
+        
+        if (!studentToDelete) {
+            console.warn("Student not found for deletion:", studentId);
+            return currentStudents;
+        }
+
+        const classIdToUpdate = studentToDelete.classId;
+
+        // Execute side effects in a timeout to ensure they run after state calc, 
+        // or just fire them. This ensures we use the correct classId found in current state.
+        setTimeout(() => {
+             // 2. Update Records
+            setRecords(prev => prev.filter(r => r.studentId !== studentId));
+
+            // 3. Update Class Counts
+            if (classIdToUpdate) {
+                setClasses(prev => prev.map(c => c.id === classIdToUpdate ? { ...c, totalStudents: Math.max(0, c.totalStudents - 1) } : c));
+            }
+        }, 0);
+
+        // 1. Remove student
+        return currentStudents.filter(s => s.id !== studentId);
+    });
+  };
+
+  const handleAIRemoveStudent = (identifier: string, targetClassName?: string): { success: boolean, message: string } => {
+       let found = false;
+       let studentName = "";
+
+       setStudents(currentStudents => {
+            let targetClassId = selectedClass?.id;
+            if (targetClassName) {
+                const match = classes.find(c => c.name.toLowerCase().includes(targetClassName.toLowerCase()));
+                if (match) targetClassId = match.id;
+            } else if (!targetClassId) {
+                targetClassId = dashboardClassId || classes[0]?.id;
+            }
+
+            // Fallback: If no target class specified, search GLOBALLY
+            let student = null;
+            const norm = identifier.toLowerCase().trim();
+
+            if (targetClassId) {
+                 student = currentStudents.find(s => 
+                    s.classId === targetClassId && 
+                    (s.name.toLowerCase().includes(norm) || s.rollNo.toLowerCase() === norm)
+                );
+            }
+
+            if (!student) {
+                 student = currentStudents.find(s => 
+                    (s.name.toLowerCase().includes(norm) || s.rollNo.toLowerCase() === norm)
+                );
+            }
+            
+            if (student) {
+                found = true;
+                studentName = student.name;
+                setTimeout(() => handleDeleteStudent(student!.id), 0);
+            }
+            
+            return currentStudents;
+       });
+
+       if (found) return { success: true, message: `Removed ${studentName}.` };
+       return { success: false, message: `Student '${identifier}' not found.` };
   };
 
   const handleClassSelection = (classId: string, date: string, session: SessionType) => {
@@ -458,6 +611,9 @@ const App: React.FC = () => {
                   const newClassName = file.name.split('.')[0] || "Imported Class";
                   const newStudents: Student[] = [];
                   
+                  // Use Performance.now() for unique IDs in loop
+                  const baseTimestamp = Date.now();
+                  
                   jsonData.forEach((row: any, index: number) => {
                       const keys = Object.keys(row);
                       const rollKey = keys.find(k => /roll|id|no/i.test(k));
@@ -468,7 +624,7 @@ const App: React.FC = () => {
                       
                       if (name && name !== "Unknown" && String(rollNo).trim() !== '') {
                           newStudents.push({
-                              id: `s-${Date.now()}-${index}`,
+                              id: `s-${baseTimestamp}-${index}-${Math.random().toString(36).substr(2,5)}`,
                               classId: newClassId,
                               name: String(name),
                               rollNo: String(rollNo).trim()
@@ -558,6 +714,78 @@ const App: React.FC = () => {
       setUploadedFiles(prev => prev.map(f => f.id === updatedFile.id ? updatedFile : f));
   };
 
+  // --- NEW STUDENT MANAGEMENT HANDLERS (Manual) ---
+  const handleAddStudent = () => {
+    if (!selectedClass) return;
+    const newStudent: Student = {
+        id: `s-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        classId: selectedClass.id,
+        name: 'New Student',
+        rollNo: ''
+    };
+    setStudents(prev => [...prev, newStudent]);
+    setClasses(prev => prev.map(c => c.id === selectedClass.id ? { ...c, totalStudents: c.totalStudents + 1 } : c));
+  };
+
+  const handleImportStudentsToClass = (file: File) => {
+      if (!selectedClass) return;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+          const data = e.target?.result;
+          if (data) {
+              const XLSX = (window as any).XLSX;
+              if (XLSX) {
+                  const workbook = XLSX.read(data, { type: 'array' });
+                  const sheetName = workbook.SheetNames[0];
+                  const sheet = workbook.Sheets[sheetName];
+                  const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+                  
+                  let headerRowIndex = 0;
+                  if (rawData.length > 0) {
+                      for(let i=0; i<Math.min(20, rawData.length); i++) {
+                          const row = (rawData[i] as any[]).map(c => String(c).toLowerCase());
+                          if (row.some(c => c.includes('roll') || c.includes('id') || c.includes('no')) && row.some(c => c.includes('name') || c.includes('student'))) {
+                              headerRowIndex = i;
+                              break;
+                          }
+                      }
+                  }
+
+                  const jsonData = XLSX.utils.sheet_to_json(sheet, { range: headerRowIndex });
+                  const newStudents: Student[] = [];
+                  const baseTimestamp = Date.now();
+
+                  jsonData.forEach((row: any, index: number) => {
+                      const keys = Object.keys(row);
+                      const rollKey = keys.find(k => /roll|id|no/i.test(k));
+                      const nameKey = keys.find(k => /name|student/i.test(k) && !/roll|id|no/i.test(k));
+                      
+                      const rollNo = rollKey ? row[rollKey] : '';
+                      const name = nameKey ? row[nameKey] : "Unknown";
+                      
+                      if (name && name !== "Unknown") {
+                          newStudents.push({
+                              id: `s-${baseTimestamp}-${index}-${Math.random().toString(36).substr(2,5)}`,
+                              classId: selectedClass.id,
+                              name: String(name),
+                              rollNo: String(rollNo).trim()
+                          });
+                      }
+                  });
+
+                  if (newStudents.length > 0) {
+                      setStudents(prev => [...prev, ...newStudents]);
+                      setClasses(prev => prev.map(c => c.id === selectedClass.id ? { ...c, totalStudents: c.totalStudents + newStudents.length } : c));
+                      alert(`Successfully added ${newStudents.length} students to ${selectedClass.name}.`);
+                  } else {
+                      alert("Could not find valid student data (Name, Roll No) in the Excel file.");
+                  }
+              }
+          }
+      };
+      reader.readAsArrayBuffer(file);
+  };
+
   // Determine active students based on view
   const activeClassId = view === 'dashboard' ? dashboardClassId : selectedClass?.id;
   const activeStudents = students.filter(s => s.classId === activeClassId);
@@ -603,6 +831,9 @@ const App: React.FC = () => {
                                 onBack={() => setSelectedClass(null)}
                                 onSave={handleSaveAttendance}
                                 onContextUpdate={handleContextUpdate}
+                                onAddStudent={handleAddStudent}
+                                onDeleteStudent={handleDeleteStudent}
+                                onImportStudents={handleImportStudentsToClass}
                             />
                         )
                     )}
@@ -620,13 +851,15 @@ const App: React.FC = () => {
         <div className={`${isChatOverlayOpen ? 'block' : 'hidden'} fixed inset-0 z-[70]`}>
              {hasChatStarted && (
                 <LiveAttendance 
-                    students={activeStudents} 
+                    students={students} 
                     files={uploadedFiles}
                     classes={classes}
                     onLiveUpdate={handleLiveUpdate} 
                     onBulkUpdate={handleBulkUpdateStatus} 
                     onUpdateFile={handleUpdateFile}
                     onDeleteFile={handleDeleteFile}
+                    onAddStudent={handleAIAddStudent}
+                    onRemoveStudent={handleAIRemoveStudent}
                     onClose={() => setIsChatOverlayOpen(false)} 
                 />
              )}

@@ -4,16 +4,18 @@ import { Mic, Video, VideoOff, Activity, XCircle, Send, ChevronDown, AlertCircle
 import { getGeminiLiveClient } from '../services/geminiService';
 import { createPcmBlob, base64ToUint8Array, decodeAudioData } from '../services/audioUtils';
 import { Student, AttendanceStatus, UploadedFile, ClassInfo } from '../types';
-import { LiveServerMessage, Modality } from '@google/genai';
+import { LiveServerMessage, Modality, Type, FunctionDeclaration } from '@google/genai';
 
 interface LiveAttendanceProps {
   students: Student[];
   files: UploadedFile[];
   classes: ClassInfo[];
-  onLiveUpdate: (rollNo: string, status: AttendanceStatus, targetName?: string) => void;
-  onBulkUpdate: (status: AttendanceStatus, targetName?: string) => void;
+  onLiveUpdate: (identifier: string, status: AttendanceStatus, targetName?: string) => { success: boolean; message: string };
+  onBulkUpdate: (status: AttendanceStatus, targetName?: string) => { success: boolean; message: string };
   onUpdateFile: (file: UploadedFile) => void;
   onDeleteFile: (fileId: string) => void;
+  onAddStudent: (name: string, rollNo: string, target?: string) => { success: boolean; message: string };
+  onRemoveStudent: (identifier: string, target?: string) => { success: boolean; message: string };
   onClose: () => void;
 }
 
@@ -28,7 +30,9 @@ const wordToNumber = (text: string): string => {
     return text.replace(/\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\b/gi, matched => map[matched.toLowerCase()] || matched);
 };
 
-const LiveAttendance: React.FC<LiveAttendanceProps> = ({ students, files, classes, onLiveUpdate, onBulkUpdate, onUpdateFile, onDeleteFile, onClose }) => {
+const LiveAttendance: React.FC<LiveAttendanceProps> = ({ 
+    students, files, classes, onLiveUpdate, onBulkUpdate, onUpdateFile, onDeleteFile, onAddStudent, onRemoveStudent, onClose 
+}) => {
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false); 
   const [messages, setMessages] = useState<{ role: 'user' | 'ai'; text: string }[]>([]);
@@ -49,8 +53,12 @@ const LiveAttendance: React.FC<LiveAttendanceProps> = ({ students, files, classe
   const onBulkUpdateRef = useRef(onBulkUpdate);
   const onUpdateFileRef = useRef(onUpdateFile);
   const onDeleteFileRef = useRef(onDeleteFile);
+  const onAddStudentRef = useRef(onAddStudent);
+  const onRemoveStudentRef = useRef(onRemoveStudent);
+  
   const filesRef = useRef(files);
   const classesRef = useRef(classes);
+  const studentsRef = useRef(students);
 
   // Keep refs updated with latest props
   useEffect(() => {
@@ -58,91 +66,131 @@ const LiveAttendance: React.FC<LiveAttendanceProps> = ({ students, files, classe
       onBulkUpdateRef.current = onBulkUpdate;
       onUpdateFileRef.current = onUpdateFile;
       onDeleteFileRef.current = onDeleteFile;
+      onAddStudentRef.current = onAddStudent;
+      onRemoveStudentRef.current = onRemoveStudent;
       filesRef.current = files;
       classesRef.current = classes;
-  }, [onLiveUpdate, onBulkUpdate, onUpdateFile, onDeleteFile, files, classes]);
+      studentsRef.current = students;
+  }, [onLiveUpdate, onBulkUpdate, onUpdateFile, onDeleteFile, onAddStudent, onRemoveStudent, files, classes, students]);
 
   // --- Tool Definitions ---
 
-  const markAttendanceTool = {
+  const markAttendanceTool: FunctionDeclaration = {
     name: 'markAttendance',
-    description: 'Marks a student as present or absent based on their roll number.',
+    description: 'Marks a student as present or absent based on their Name OR Roll Number.',
     parameters: {
-      type: 'OBJECT',
+      type: Type.OBJECT,
       properties: {
-        rollNo: { type: 'STRING', description: 'The roll number of the student' },
-        status: { type: 'STRING', enum: ['PRESENT', 'ABSENT', 'LATE'] },
-        target: { type: 'STRING', description: 'The name of the class, sheet, or file to mark attendance in. If not specified, uses the currently active class.' }
+        identifier: { type: Type.STRING, description: 'The Name OR Roll Number of the student (or multiple separated by comma)' },
+        status: { type: Type.STRING, enum: ['PRESENT', 'ABSENT', 'LATE'] },
+        target: { type: Type.STRING, description: 'The name of the class, sheet, or file. Optional.' }
       },
-      required: ['rollNo', 'status']
+      required: ['identifier', 'status']
     }
   };
 
-  const markAllTool = {
+  const markAllTool: FunctionDeclaration = {
       name: 'markAllAttendance',
       description: 'Marks all students in the class with a specific status.',
       parameters: {
-          type: 'OBJECT',
+          type: Type.OBJECT,
           properties: {
-              status: { type: 'STRING', enum: ['PRESENT', 'ABSENT', 'LATE'] },
-              target: { type: 'STRING', description: 'The name of the class, sheet, or file to mark attendance in.' }
+              status: { type: Type.STRING, enum: ['PRESENT', 'ABSENT', 'LATE'] },
+              target: { type: Type.STRING, description: 'The name of the class, sheet, or file.' }
           },
           required: ['status']
       }
   };
 
-  const updateFileTool = {
+  const updateFileTool: FunctionDeclaration = {
       name: 'updateFileDetails',
-      description: 'Renames an uploaded file or updates the text content of a note/document. Works for any uploaded file.',
+      description: 'Renames an uploaded file or updates the text content of a note/document.',
       parameters: {
-          type: 'OBJECT',
+          type: Type.OBJECT,
           properties: {
-              fileId: { type: 'STRING', description: 'The ID of the file to update (found in context)' },
-              newName: { type: 'STRING', description: 'The new name for the file (optional)' },
-              newContent: { type: 'STRING', description: 'The new text content for the file (only for text/note files) (optional)' }
+              fileId: { type: Type.STRING, description: 'The ID of the file to update' },
+              newName: { type: Type.STRING, description: 'The new name for the file' },
+              newContent: { type: Type.STRING, description: 'The new text content' }
           },
           required: ['fileId']
       }
   };
 
-  const deleteFileTool = {
+  const deleteFileTool: FunctionDeclaration = {
       name: 'deleteFile',
       description: 'Permanently deletes an uploaded file.',
       parameters: {
-          type: 'OBJECT',
+          type: Type.OBJECT,
           properties: {
-              fileId: { type: 'STRING', description: 'The ID of the file to delete' }
+              fileId: { type: Type.STRING, description: 'The ID of the file to delete' }
           },
           required: ['fileId']
       }
   };
 
-  const toolsConfig = [{ functionDeclarations: [markAttendanceTool as any, markAllTool as any, updateFileTool as any, deleteFileTool as any] }];
+  const addStudentTool: FunctionDeclaration = {
+      name: 'addStudent',
+      description: 'Adds a new student to the class list.',
+      parameters: {
+          type: Type.OBJECT,
+          properties: {
+              name: { type: Type.STRING, description: 'Name of the student' },
+              rollNo: { type: Type.STRING, description: 'Roll number of the student (optional)' },
+              target: { type: Type.STRING, description: 'Target class name (optional)' }
+          },
+          required: ['name']
+      }
+  };
+
+  const removeStudentTool: FunctionDeclaration = {
+      name: 'removeStudent',
+      description: 'Removes a student from the class list by name or roll number.',
+      parameters: {
+          type: Type.OBJECT,
+          properties: {
+              identifier: { type: Type.STRING, description: 'The name or roll number of the student to remove' },
+              target: { type: Type.STRING, description: 'Target class name (optional)' }
+          },
+          required: ['identifier']
+      }
+  };
+
+  const toolsConfig = [{ functionDeclarations: [markAttendanceTool, markAllTool, updateFileTool, deleteFileTool, addStudentTool, removeStudentTool] }];
   
   // Construct dynamic context
   const getSystemInstruction = () => {
-    const studentContextList = students.map(s => `Roll ${s.rollNo}: ${s.name}`).join(', ');
+    // Group students by class to provide clear context
+    const studentsByClass = classesRef.current.map(cls => {
+        const classStudents = studentsRef.current.filter(s => s.classId === cls.id);
+        if (classStudents.length === 0) return null;
+        const list = classStudents.map(s => `${s.name} (Roll ${s.rollNo})`).join(', ');
+        return `CLASS '${cls.name}': [${list}]`;
+    }).filter(Boolean).join('\n');
+
     const fileContextList = filesRef.current.map(f => `[ID: ${f.id}, Name: '${f.name}', Type: ${f.type}]`).join(', ');
-    const classContextList = classesRef.current.map(c => `[Name: '${c.name}', Students: ${c.totalStudents}]`).join(', ');
 
     return `You are an attendance assistant and file manager.
       
-      Current Active Class List: ${studentContextList}.
+      Here is the database of ALL students grouped by Class:
+      ${studentsByClass || "No students found."}
       
-      ALL AVAILABLE MASTER SHEETS / CLASSES: ${classContextList || "None"}.
       ALL UPLOADED FILES: ${fileContextList || "None"}.
       
       RULES:
-      1. Attendance: Mark students present/absent. You can mark attendance in ANY class or master sheet by name using the 'target' parameter.
-         - If the user says "Mark roll 1 present in Class 10-A", call markAttendance with target="Class 10-A".
-         - If the user says "Mark roll 1 present in the Physics file", call markAttendance with target="Physics".
-         - If no class is specified, do NOT send a target (it will use the active one).
+      1. Attendance: Mark students using 'markAttendance'.
+         - You accept Name OR Roll Number as 'identifier'.
+         - If user says "Mark John present", identifier is "John".
+         - If user says "Mark Roll 5 in Class A", identifier is "5", target is "Class A".
+         - If user says "Mark 1, 11 and 21", please call the function with identifier "1, 11, 21" OR call it three times. The system handles comma-separated lists.
+         - ALWAYS try to mark attendance even if the student is not explicitly listed in the system instruction above, as the database might have been updated.
       
-      2. File Management: You can rename files or delete them. If the user asks to "change the note" or "update text", use updateFileDetails with newContent.
+      2. Student Management: 
+         - Use 'addStudent' to add a student to the list.
+         - Use 'removeStudent' to remove a student from the list.
       
-      3. Any uploaded file is considered a master sheet. If the user refers to a file that looks like a class (e.g., "Biology List"), assume they want to mark attendance in it or edit it.
+      3. File Management: Rename or delete files using 'updateFileDetails' or 'deleteFile'.
       
-      4. Confirm actions concisely.
+      4. Confirm actions concisely. If a student is not found, report it clearly.
     `;
   };
 
@@ -195,193 +243,209 @@ const LiveAttendance: React.FC<LiveAttendanceProps> = ({ students, files, classe
         return;
     }
 
-    let aiClient;
     try {
-        aiClient = getGeminiLiveClient();
-    } catch (e: any) {
-        alert(e.message);
-        return;
-    }
-    
-    setIsConnecting(true);
-    
-    // Safety timeout
-    const connectionTimeout = setTimeout(() => {
-        if (!isConnectedRef.current && isConnecting) {
-            console.warn("Connection timeout triggered");
-            resetConnection();
-            alert("Connection timed out. Please check your network and try again.");
-        }
-    }, 10000);
-
-    try {
-      // 1. Get Media Stream (with race timeout)
-      const streamPromise = navigator.mediaDevices.getUserMedia({ audio: true });
-      const timeoutPromise = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Mic permission timeout")), 8000));
-      const stream = await Promise.race([streamPromise, timeoutPromise]) as MediaStream;
-      
-      if (!mountedRef.current) {
-          stream.getTracks().forEach(t => t.stop());
-          return; 
-      }
-
-      streamRef.current = stream;
-
-      // 2. Setup Audio Contexts
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const outputCtx = new AudioContextClass({ sampleRate: 24000 });
-      const inputCtx = new AudioContextClass({ sampleRate: 16000 });
-      
-      // CRITICAL: Resume audio context if suspended (browser autoplay policy)
-      if (outputCtx.state === 'suspended') {
-          await outputCtx.resume();
-      }
-      
-      audioContextRef.current = outputCtx;
-      inputContextRef.current = inputCtx;
-
-      // 3. Connect to Gemini
-      const session = await aiClient.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-        callbacks: {
-          onopen: () => {
-            if (!mountedRef.current) {
+        const aiClient = getGeminiLiveClient();
+        setIsConnecting(true);
+        
+        // Safety timeout
+        const connectionTimeout = setTimeout(() => {
+            if (!isConnectedRef.current && isConnecting) {
+                console.warn("Connection timeout triggered");
                 resetConnection();
-                return;
+                alert("Connection timed out. Please check your network and try again.");
             }
-            console.log("Live Session Opened");
-            clearTimeout(connectionTimeout);
-            isConnectedRef.current = true;
-            setIsConnected(true);
-            setIsConnecting(false);
-          },
-          onmessage: async (msg: LiveServerMessage) => {
-            if (!mountedRef.current) return;
+        }, 12000);
 
-            if (msg.serverContent?.inputTranscription) {
-                const transcript = msg.serverContent.inputTranscription.text;
-                if (transcript) {
-                    setMessages(prev => {
-                        const last = prev[prev.length - 1];
-                        if (last && last.role === 'user' && !last.text.endsWith('.')) {
-                             return [...prev.slice(0, -1), { role: 'user', text: transcript }];
-                        }
-                        return [...prev, { role: 'user', text: transcript }];
-                    });
-                    // Execute local command immediately for responsiveness
-                    executeLocalCommand(transcript);
+        // 1. Get Media Stream (with race timeout)
+        const streamPromise = navigator.mediaDevices.getUserMedia({ audio: true });
+        const timeoutPromise = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Mic permission timeout")), 8000));
+        const stream = await Promise.race([streamPromise, timeoutPromise]) as MediaStream;
+        
+        if (!mountedRef.current) {
+            stream.getTracks().forEach(t => t.stop());
+            return; 
+        }
+
+        streamRef.current = stream;
+
+        // 2. Setup Audio Contexts
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        const outputCtx = new AudioContextClass({ sampleRate: 24000 });
+        const inputCtx = new AudioContextClass({ sampleRate: 16000 });
+        
+        // CRITICAL: Resume audio context if suspended (browser autoplay policy)
+        if (outputCtx.state === 'suspended') {
+            await outputCtx.resume();
+        }
+        
+        audioContextRef.current = outputCtx;
+        inputContextRef.current = inputCtx;
+
+        // 3. Connect to Gemini
+        const session = await aiClient.live.connect({
+            model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+            callbacks: {
+            onopen: () => {
+                if (!mountedRef.current) {
+                    resetConnection();
+                    return;
                 }
-            }
+                console.log("Live Session Opened");
+                clearTimeout(connectionTimeout);
+                isConnectedRef.current = true;
+                setIsConnected(true);
+                setIsConnecting(false);
+            },
+            onmessage: async (msg: LiveServerMessage) => {
+                if (!mountedRef.current) return;
 
-            if (msg.toolCall) {
-                const responses = [];
-                for (const fc of msg.toolCall.functionCalls) {
-                    if (fc.name === 'markAttendance') {
-                        const { rollNo, status, target } = fc.args as any;
-                        const normalizedStatus = status.toUpperCase() as AttendanceStatus;
-                        onLiveUpdateRef.current(String(rollNo), normalizedStatus, target);
-                        setLastAction(`Marked Roll ${rollNo} ${normalizedStatus} ${target ? `in ${target}` : ''}`);
-                        responses.push({ id: fc.id, name: fc.name, response: { result: "Success" } });
-                        setMessages(prev => [...prev, { role: 'ai', text: `Marked Roll ${rollNo} as ${normalizedStatus} ${target ? `in ${target}` : ''}` }]);
-                    } else if (fc.name === 'markAllAttendance') {
-                        const { status, target } = fc.args as any;
-                        const normalizedStatus = status.toUpperCase() as AttendanceStatus;
-                        onBulkUpdateRef.current(normalizedStatus, target);
-                        setLastAction(`Marked All ${normalizedStatus} ${target ? `in ${target}` : ''}`);
-                        responses.push({ id: fc.id, name: fc.name, response: { result: "Success" } });
-                        setMessages(prev => [...prev, { role: 'ai', text: `Marked everyone as ${normalizedStatus} ${target ? `in ${target}` : ''}` }]);
-                    } else if (fc.name === 'updateFileDetails') {
-                        const { fileId, newName, newContent } = fc.args as any;
-                        const file = filesRef.current.find(f => f.id === fileId);
-                        if (file) {
-                            const updatedFile = { ...file };
-                            if (newName) updatedFile.name = newName;
-                            if (newContent) updatedFile.content = newContent;
-                            onUpdateFileRef.current(updatedFile);
-                            setLastAction(`Updated File: ${newName || file.name}`);
-                            responses.push({ id: fc.id, name: fc.name, response: { result: "File updated" } });
-                            setMessages(prev => [...prev, { role: 'ai', text: `Updated file ${file.name}` }]);
-                        } else {
-                            responses.push({ id: fc.id, name: fc.name, response: { result: "File not found" } });
-                        }
-                    } else if (fc.name === 'deleteFile') {
-                        const { fileId } = fc.args as any;
-                        const file = filesRef.current.find(f => f.id === fileId);
-                        if (file) {
-                            onDeleteFileRef.current(fileId);
-                            setLastAction(`Deleted File: ${file.name}`);
-                            responses.push({ id: fc.id, name: fc.name, response: { result: "File deleted" } });
-                            setMessages(prev => [...prev, { role: 'ai', text: `Deleted file ${file.name}` }]);
-                        } else {
-                            responses.push({ id: fc.id, name: fc.name, response: { result: "File not found" } });
-                        }
+                if (msg.serverContent?.inputTranscription) {
+                    const transcript = msg.serverContent.inputTranscription.text;
+                    if (transcript) {
+                        setMessages(prev => {
+                            const last = prev[prev.length - 1];
+                            if (last && last.role === 'user' && !last.text.endsWith('.')) {
+                                return [...prev.slice(0, -1), { role: 'user', text: transcript }];
+                            }
+                            return [...prev, { role: 'user', text: transcript }];
+                        });
+                        // Execute local command immediately for responsiveness
+                        executeLocalCommand(transcript);
                     }
                 }
-                if (activeSessionRef.current && responses.length > 0) {
-                    activeSessionRef.current.sendToolResponse({ functionResponses: responses });
+
+                if (msg.toolCall) {
+                    const responses = [];
+                    for (const fc of msg.toolCall.functionCalls) {
+                        try {
+                            if (fc.name === 'markAttendance') {
+                                const { identifier, status, target } = fc.args as any;
+                                const normalizedStatus = status.toUpperCase() as AttendanceStatus;
+                                const result = onLiveUpdateRef.current(identifier, normalizedStatus, target);
+                                
+                                setLastAction(result.message);
+                                responses.push({ id: fc.id, name: fc.name, response: { result: result.message } });
+                                setMessages(prev => [...prev, { role: 'ai', text: result.message }]);
+                            
+                            } else if (fc.name === 'markAllAttendance') {
+                                const { status, target } = fc.args as any;
+                                const normalizedStatus = status.toUpperCase() as AttendanceStatus;
+                                const result = onBulkUpdateRef.current(normalizedStatus, target);
+                                
+                                setLastAction(result.message);
+                                responses.push({ id: fc.id, name: fc.name, response: { result: result.message } });
+                                setMessages(prev => [...prev, { role: 'ai', text: result.message }]);
+
+                            } else if (fc.name === 'addStudent') {
+                                const { name, rollNo, target } = fc.args as any;
+                                const result = onAddStudentRef.current(name, rollNo, target);
+                                
+                                setLastAction(result.message);
+                                responses.push({ id: fc.id, name: fc.name, response: { result: result.message } });
+                                setMessages(prev => [...prev, { role: 'ai', text: result.message }]);
+
+                            } else if (fc.name === 'removeStudent') {
+                                const { identifier, target } = fc.args as any;
+                                const result = onRemoveStudentRef.current(identifier, target);
+                                
+                                setLastAction(result.message);
+                                responses.push({ id: fc.id, name: fc.name, response: { result: result.message } });
+                                setMessages(prev => [...prev, { role: 'ai', text: result.message }]);
+
+                            } else if (fc.name === 'updateFileDetails') {
+                                const { fileId, newName, newContent } = fc.args as any;
+                                const file = filesRef.current.find(f => f.id === fileId);
+                                if (file) {
+                                    const updatedFile = { ...file };
+                                    if (newName) updatedFile.name = newName;
+                                    if (newContent) updatedFile.content = newContent;
+                                    onUpdateFileRef.current(updatedFile);
+                                    setLastAction(`Updated File: ${newName || file.name}`);
+                                    responses.push({ id: fc.id, name: fc.name, response: { result: "File updated" } });
+                                } else {
+                                    responses.push({ id: fc.id, name: fc.name, response: { result: "File not found" } });
+                                }
+                            } else if (fc.name === 'deleteFile') {
+                                const { fileId } = fc.args as any;
+                                const file = filesRef.current.find(f => f.id === fileId);
+                                if (file) {
+                                    onDeleteFileRef.current(fileId);
+                                    setLastAction(`Deleted File: ${file.name}`);
+                                    responses.push({ id: fc.id, name: fc.name, response: { result: "File deleted" } });
+                                } else {
+                                    responses.push({ id: fc.id, name: fc.name, response: { result: "File not found" } });
+                                }
+                            }
+                        } catch(e) {
+                            console.error("Tool execution error", e);
+                            responses.push({ id: fc.id, name: fc.name, response: { result: "Error executing tool" } });
+                        }
+                    }
+                    if (activeSessionRef.current && responses.length > 0) {
+                        activeSessionRef.current.sendToolResponse({ functionResponses: responses });
+                    }
                 }
-            }
 
-            const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (audioData) {
-              const ctx = audioContextRef.current;
-              if (ctx && ctx.state === 'running') {
-                try {
-                    nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-                    const buffer = await decodeAudioData(base64ToUint8Array(audioData), ctx);
-                    const source = ctx.createBufferSource();
-                    source.buffer = buffer;
-                    source.connect(ctx.destination);
-                    source.start(nextStartTimeRef.current);
-                    nextStartTimeRef.current += buffer.duration;
-                } catch (e) { console.error(e); }
-              }
+                const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                if (audioData) {
+                const ctx = audioContextRef.current;
+                if (ctx && ctx.state === 'running') {
+                    try {
+                        nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+                        const buffer = await decodeAudioData(base64ToUint8Array(audioData), ctx);
+                        const source = ctx.createBufferSource();
+                        source.buffer = buffer;
+                        source.connect(ctx.destination);
+                        source.start(nextStartTimeRef.current);
+                        nextStartTimeRef.current += buffer.duration;
+                    } catch (e) { console.error(e); }
+                }
+                }
+            },
+            onclose: () => {
+                console.log("Live Session Closed");
+                resetConnection();
+            },
+            onerror: (err) => {
+                console.error("Live Session Error", err);
+                resetConnection();
+                alert("Connection Error. Please check your network or API Key.");
             }
-          },
-          onclose: () => {
-             console.log("Live Session Closed");
-             resetConnection();
-          },
-          onerror: (err) => {
-            console.error("Live Session Error", err);
-            resetConnection();
-            alert("Connection interrupted. Check network/API Key.");
-          }
-        },
-        config: {
-          responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {}, 
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: getSystemInstruction(),
-          tools: toolsConfig
-        }
-      });
-      activeSessionRef.current = session;
+            },
+            config: {
+            responseModalities: [Modality.AUDIO],
+            inputAudioTranscription: {}, 
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
+            systemInstruction: getSystemInstruction(),
+            tools: toolsConfig
+            }
+        });
+        activeSessionRef.current = session;
 
-      const source = inputCtx.createMediaStreamSource(stream);
-      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-      processor.onaudioprocess = (e) => {
-        if (!isConnectedRef.current || !activeSessionRef.current) return;
-        const inputData = e.inputBuffer.getChannelData(0);
-        const pcmBlob = createPcmBlob(inputData);
-        try { activeSessionRef.current.sendRealtimeInput({ media: pcmBlob }); } catch (err) {}
-      };
-      source.connect(processor);
-      processor.connect(inputCtx.destination);
+        const source = inputCtx.createMediaStreamSource(stream);
+        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (e) => {
+            if (!isConnectedRef.current || !activeSessionRef.current) return;
+            const inputData = e.inputBuffer.getChannelData(0);
+            const pcmBlob = createPcmBlob(inputData);
+            try { activeSessionRef.current.sendRealtimeInput({ media: pcmBlob }); } catch (err) {}
+        };
+        source.connect(processor);
+        processor.connect(inputCtx.destination);
 
     } catch (e: any) {
       console.error(e);
-      clearTimeout(connectionTimeout);
+      // Ensure state is reset on error
       resetConnection();
-      alert("Failed to start voice session: " + (e.message || "Unknown error"));
+      alert("Failed to start session: " + (e.message || "Unknown error"));
     }
   };
 
   const executeLocalCommand = (text: string): boolean => {
       const normalizedText = wordToNumber(text).toLowerCase();
       
-      // If the command is complex (e.g., "except", "but", "file", "class"), delegate to AI
-      if (normalizedText.includes('except') || normalizedText.includes('but') || (normalizedText.includes('present') && normalizedText.includes('absent')) || normalizedText.includes('file') || normalizedText.includes('class') || normalizedText.includes('sheet')) {
+      // If the command is complex or involves adding/removing, delegate to AI
+      if (normalizedText.includes('add') || normalizedText.includes('remove') || normalizedText.includes('delete') || normalizedText.includes('create')) {
           return false;
       }
 
@@ -396,9 +460,9 @@ const LiveAttendance: React.FC<LiveAttendanceProps> = ({ students, files, classe
 
       // Bulk All
       if (normalizedText.includes('all') || normalizedText.includes('everyone')) {
-          onBulkUpdateRef.current(status);
-          setMessages(prev => [...prev, { role: 'ai', text: `(Local) Marked everyone as ${status}.` }]);
-          setLastAction(`Bulk Update: ${status}`);
+          const result = onBulkUpdateRef.current(status);
+          setMessages(prev => [...prev, { role: 'ai', text: `(Local) ${result.message}` }]);
+          setLastAction(result.message);
           return true;
       }
 
@@ -407,11 +471,11 @@ const LiveAttendance: React.FC<LiveAttendanceProps> = ({ students, files, classe
       if (numbers && numbers.length > 0) {
           let successCount = 0;
           numbers.forEach(num => {
-              onLiveUpdateRef.current(num, status!);
-              successCount++;
+              const res = onLiveUpdateRef.current(num, status!);
+              if (res.success) successCount++;
           });
-          setMessages(prev => [...prev, { role: 'ai', text: `(Local) Marked Roll(s) ${numbers.join(', ')} as ${status}.` }]);
-          setLastAction(`Updated Roll(s): ${numbers.join(', ')}`);
+          setMessages(prev => [...prev, { role: 'ai', text: `(Local) Marked ${successCount} student(s) as ${status}.` }]);
+          setLastAction(`Updated ${successCount} student(s)`);
           return true;
       }
       return false;
@@ -445,30 +509,25 @@ const LiveAttendance: React.FC<LiveAttendanceProps> = ({ students, files, classe
                   let responseText = "";
                   for (const fc of calls) {
                       if (fc.name === 'markAttendance') {
-                           const { rollNo, status, target } = fc.args as any;
-                           onLiveUpdateRef.current(String(rollNo), status.toUpperCase(), target);
-                           responseText += `Marked ${rollNo} ${status} ${target ? `in ${target}` : ''}. `;
+                           const { identifier, status, target } = fc.args as any;
+                           const r = onLiveUpdateRef.current(identifier, status.toUpperCase(), target);
+                           responseText += `${r.message} `;
                       } else if (fc.name === 'markAllAttendance') {
                            const { status, target } = fc.args as any;
-                           onBulkUpdateRef.current(status.toUpperCase(), target);
-                           responseText += `Marked all ${status} ${target ? `in ${target}` : ''}. `;
-                      } else if (fc.name === 'updateFileDetails') {
-                          const { fileId, newName, newContent } = fc.args as any;
-                          const file = filesRef.current.find(f => f.id === fileId);
-                          if (file) {
-                              const updatedFile = { ...file };
-                              if (newName) updatedFile.name = newName;
-                              if (newContent) updatedFile.content = newContent;
-                              onUpdateFileRef.current(updatedFile);
-                              responseText += `Updated ${file.name}. `;
-                          }
+                           const r = onBulkUpdateRef.current(status.toUpperCase(), target);
+                           responseText += `${r.message} `;
+                      } else if (fc.name === 'addStudent') {
+                           const { name, rollNo, target } = fc.args as any;
+                           const r = onAddStudentRef.current(name, rollNo, target);
+                           responseText += `${r.message} `;
+                      } else if (fc.name === 'removeStudent') {
+                           const { identifier, target } = fc.args as any;
+                           const r = onRemoveStudentRef.current(identifier, target);
+                           responseText += `${r.message} `;
                       } else if (fc.name === 'deleteFile') {
                           const { fileId } = fc.args as any;
-                          const file = filesRef.current.find(f => f.id === fileId);
-                          if (file) {
-                              onDeleteFileRef.current(fileId);
-                              responseText += `Deleted ${file.name}. `;
-                          }
+                          onDeleteFileRef.current(fileId);
+                          responseText += `Deleted file. `;
                       }
                   }
                   setMessages(prev => [...prev, { role: 'ai', text: responseText || "Done." }]);
@@ -476,8 +535,8 @@ const LiveAttendance: React.FC<LiveAttendanceProps> = ({ students, files, classe
               } else if (result.text) {
                   setMessages(prev => [...prev, { role: 'ai', text: result.text }]);
               }
-          } catch (e) {
-              setMessages(prev => [...prev, { role: 'ai', text: "Error: Could not process text." }]);
+          } catch (e: any) {
+              setMessages(prev => [...prev, { role: 'ai', text: `Error: ${e.message}` }]);
           }
       }
   };
@@ -562,7 +621,7 @@ const LiveAttendance: React.FC<LiveAttendanceProps> = ({ students, files, classe
                     value={textInput}
                     onChange={(e) => setTextInput(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && sendText()}
-                    placeholder="Type or speak (e.g. 'Mark 1, 2 present')"
+                    placeholder="Type or speak (e.g. 'Mark John present')"
                     className="flex-1 bg-slate-700 border-none rounded-full px-5 py-3 text-white placeholder:text-slate-400 focus:ring-2 focus:ring-indigo-500 outline-none"
                 />
                 <button onClick={sendText} className="bg-indigo-600 text-white p-3 rounded-full hover:bg-indigo-500 transition-colors">
